@@ -282,6 +282,21 @@ func (p *L4Proxy) closeClientConnIfCurrent(expected *l4HTTP3Client) {
 	closeL4HTTP3(expected.udpConn, expected.quicConn)
 }
 
+// Close closes the shared HTTP/3 connection used by all L4 streams.
+func (p *L4Proxy) Close() error {
+	if p == nil {
+		return nil
+	}
+	p.connMu.Lock()
+	client := p.client
+	p.client = nil
+	p.connMu.Unlock()
+	if client != nil {
+		closeL4HTTP3(client.udpConn, client.quicConn)
+	}
+	return nil
+}
+
 func listenUDPForEndpoint(endpoint *net.UDPAddr) (*net.UDPConn, error) {
 	if endpoint.IP.To4() == nil {
 		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6zero})

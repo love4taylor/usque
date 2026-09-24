@@ -19,6 +19,7 @@ Usque is an open-source reimplementation of the Cloudflare WARP client's MASQUE 
       - [On Windows](#on-windows)
       - [Routes on Linux](#routes-on-linux)
       - [Routes on Windows](#routes-on-windows)
+    - [Linux TPROXY mode (TCP and UDP)](#linux-tproxy-mode-tcp-and-udp)
     - [SOCKS5 Proxy Mode (easy, cross-platform)](#socks5-proxy-mode-easy-cross-platform)
     - [HTTP Proxy Mode (easy, cross-platform)](#http-proxy-mode-easy-cross-platform)
     - [L4 Proxy Modes (easy, cross-platform)](#l4-proxy-modes-easy-cross-platform)
@@ -248,6 +249,42 @@ route add ::/0 [TUNNEL_GATEWAY] metric 1 if [TUN_INTERFACE_INDEX]
 > [!CAUTION]
 > Always be careful with default routes, especially if you are running this on a headless machine. It is very easy to close yourself out of your current session. I suggest [network namespaces](https://man7.org/linux/man-pages/man7/network_namespaces.7.html) on Linux as a safer playground for experiments or a spare VM with physical access or serial console.
 > On Windows, you can set specific routes first such as `8.8.8.8/32` to ensure the tunnel works before adding a default route.
+
+### Linux TPROXY mode (TCP and UDP)
+
+`tproxy` avoids creating a host-visible TUN interface. It receives TCP and UDP packets redirected by Linux netfilter, opens the corresponding destination inside the userspace tunnel network, and relays the traffic through MASQUE. It is Linux-only, requires root, and needs external firewall rules.
+
+Start the listener on loopback:
+
+```shell
+$ sudo ./usque tproxy --bind 127.0.0.1 --port 12345
+```
+
+The listener selects its address family from `--bind`; use `--bind ::` for an IPv6 listener. Run separate instances (or provide separate listeners) if both families must be accepted on the same host.
+
+For forwarded IPv4 traffic, an example `iptables` setup is:
+
+```shell
+$ sudo ip rule add fwmark 0x1/0x1 table 100
+$ sudo ip route add local 0.0.0.0/0 dev lo table 100
+$ sudo iptables -t mangle -N USQUE_TPROXY
+$ sudo iptables -t mangle -A PREROUTING -j USQUE_TPROXY
+$ sudo iptables -t mangle -A USQUE_TPROXY -m socket -j RETURN
+$ sudo iptables -t mangle -A USQUE_TPROXY -d 127.0.0.0/8 -j RETURN
+$ sudo iptables -t mangle -A USQUE_TPROXY -d 10.0.0.0/8 -j RETURN
+$ sudo iptables -t mangle -A USQUE_TPROXY -d 172.16.0.0/12 -j RETURN
+$ sudo iptables -t mangle -A USQUE_TPROXY -d 192.168.0.0/16 -j RETURN
+$ sudo iptables -t mangle -A USQUE_TPROXY -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port 12345 --tproxy-mark 0x1/0x1
+$ sudo iptables -t mangle -A USQUE_TPROXY -p udp -j TPROXY --on-ip 127.0.0.1 --on-port 12345 --tproxy-mark 0x1/0x1
+```
+
+IPv6 requires equivalent `ip -6 rule`, `ip -6 route`, and `ip6tables` rules. Do not redirect the Cloudflare endpoint itself; otherwise the MASQUE control connection loops back into the proxy. On a server, exclude the management address and SSH port before the TPROXY rules. The listener uses a 60-second default UDP flow timeout, configurable with `--udp-timeout`.
+
+The repository also includes a systemd/nftables wrapper in `scripts/tproxy/`. From the repository root, run `sudo ./scripts/tproxy/install-usque-tproxy.sh`; the installer compiles the current source tree with Go, injects `dev` plus the current Git commit and UTC build time, installs the resulting binary, enables IPv4 and IPv6 TPROXY listeners, loads an isolated `inet usque_tproxy` ruleset directly with nftables, and removes the policy routing and nftables table on stop. Override the metadata with `USQUE_VERSION`, `USQUE_COMMIT`, or `USQUE_BUILD_DATE` when needed. Incoming connections to local services are returned by the FIB check, and their reply-direction packets bypass OUTPUT marking so SSH and other host services keep the physical source path instead of WARP. The native nftables table is intentionally separate from firewalld; after a firewalld reload, restart `usque-tproxy.service` if the ruleset is absent.
+
+The systemd wrapper enables `--tcp-l4` by default: TCP connections use the HTTP/3 L4 CONNECT stream path and bypass the gVisor netstack. UDP connections continue to use the Connect-IP netstack path because L4 CONNECT is TCP-only. This means the service maintains the regular Connect-IP tunnel for UDP and opens a separate L4 HTTP/3 connection on demand for TCP. The L4 path requires HTTP/3; `--http2` only affects the Connect-IP/UDP tunnel.
+
+When firewalld is enabled, set `IPv6_rpfilter=no` in `/etc/firewalld/firewalld.conf` and restart firewalld before starting this service. firewalld's IPv6 RPF rule uses the TPROXY mark in its FIB lookup; even `loose` mode can reject packets whose policy route intentionally terminates on `lo`. This changes only IPv6 reverse-path filtering; firewalld zones and SSH filtering remain enabled. The wrapper detects the incompatible strict rule and refuses to install rules until it is fixed.
 
 ### SOCKS5 Proxy Mode (easy, cross-platform)
 
