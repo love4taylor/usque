@@ -50,7 +50,9 @@ type L4Proxy struct {
 	connectTimeout    time.Duration
 	connectRetryCount int
 	connMu            sync.Mutex
+	connectMu         sync.Mutex
 	client            *l4HTTP3Client
+	closed            bool
 	dialFn            func(context.Context, string) (*l4TCPConn, error)
 }
 
@@ -97,6 +99,9 @@ func NewL4Proxy(cfg L4ProxyConfig) (*L4Proxy, error) {
 func (p *L4Proxy) DialContext(ctx context.Context, target string) (net.Conn, error) {
 	if p == nil || p.tlsConfig == nil {
 		return nil, fmt.Errorf("missing TLS config")
+	}
+	if p.isClosed() {
+		return nil, net.ErrClosed
 	}
 	if p.endpoint == nil {
 		return nil, fmt.Errorf("missing HTTP/3 UDP endpoint")
@@ -227,6 +232,25 @@ func shouldReconnectOnOpenStreamError(ctx context.Context, err error) bool {
 
 func (p *L4Proxy) getOrCreateClientConn(ctx context.Context) (*l4HTTP3Client, error) {
 	p.connMu.Lock()
+	if p.closed {
+		p.connMu.Unlock()
+		return nil, net.ErrClosed
+	}
+	if p.client != nil {
+		client := p.client
+		p.connMu.Unlock()
+		return client, nil
+	}
+	p.connMu.Unlock()
+
+	p.connectMu.Lock()
+	defer p.connectMu.Unlock()
+
+	p.connMu.Lock()
+	if p.closed {
+		p.connMu.Unlock()
+		return nil, net.ErrClosed
+	}
 	if p.client != nil {
 		client := p.client
 		p.connMu.Unlock()
@@ -254,6 +278,11 @@ func (p *L4Proxy) getOrCreateClientConn(ctx context.Context) (*l4HTTP3Client, er
 	}
 
 	p.connMu.Lock()
+	if p.closed {
+		p.connMu.Unlock()
+		closeL4HTTP3(newClient.udpConn, newClient.quicConn)
+		return nil, net.ErrClosed
+	}
 	if p.client != nil {
 		current := p.client
 		p.connMu.Unlock()
@@ -282,6 +311,12 @@ func (p *L4Proxy) closeClientConnIfCurrent(expected *l4HTTP3Client) {
 	closeL4HTTP3(expected.udpConn, expected.quicConn)
 }
 
+func (p *L4Proxy) isClosed() bool {
+	p.connMu.Lock()
+	defer p.connMu.Unlock()
+	return p.closed
+}
+
 // Close closes the shared HTTP/3 connection used by all L4 streams.
 func (p *L4Proxy) Close() error {
 	if p == nil {
@@ -290,6 +325,7 @@ func (p *L4Proxy) Close() error {
 	p.connMu.Lock()
 	client := p.client
 	p.client = nil
+	p.closed = true
 	p.connMu.Unlock()
 	if client != nil {
 		closeL4HTTP3(client.udpConn, client.quicConn)

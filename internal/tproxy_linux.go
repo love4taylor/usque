@@ -7,13 +7,14 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
 	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
-const originalDestinationSocketOption = 80
+const originalDestinationSocketOption = unix.SO_ORIGINAL_DST
 
 func ListenTransparentTCP(address string) (net.Listener, error) {
 	var listenConfig net.ListenConfig
@@ -124,7 +125,7 @@ func OriginalDestination(conn net.Conn) (string, error) {
 				controlErr = err
 				return
 			}
-			destination = net.JoinHostPort(address.Addr().String(), fmt.Sprint(address.Port()))
+			destination = net.JoinHostPort(address.Addr().String(), strconv.Itoa(int(address.Port())))
 			return
 		}
 		address, err := originalDestination6(fd)
@@ -132,7 +133,7 @@ func OriginalDestination(conn net.Conn) (string, error) {
 			controlErr = err
 			return
 		}
-		destination = net.JoinHostPort(address.Addr().String(), fmt.Sprint(address.Port()))
+		destination = net.JoinHostPort(address.Addr().String(), strconv.Itoa(int(address.Port())))
 	}); err != nil {
 		return "", err
 	}

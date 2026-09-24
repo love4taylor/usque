@@ -7,7 +7,10 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Diniboy1123/usque/api"
@@ -26,6 +29,8 @@ var tproxyCmd = &cobra.Command{
 }
 
 func runTProxy(cmd *cobra.Command, _ []string) {
+	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	if !config.ConfigLoaded {
 		cmd.Println("Config not loaded. Please register first.")
 		return
@@ -68,12 +73,7 @@ func runTProxy(cmd *cobra.Command, _ []string) {
 	alwaysReconnect, _ := cmd.Flags().GetBool("always-reconnect")
 	var tcpProxy *api.L4Proxy
 	if tcpL4 {
-		l4Cert, certErr := internal.GenerateCert(privKey, &privKey.PublicKey)
-		if certErr != nil {
-			cmd.Printf("Failed to generate L4 certificate: %v\n", certErr)
-			return
-		}
-		l4TLSConfig, tlsErr := api.PrepareTlsConfig(privKey, peerPubKey, l4Cert, internal.L4ConnectSNI, insecure)
+		l4TLSConfig, tlsErr := api.PrepareTlsConfig(privKey, peerPubKey, cert, internal.L4ConnectSNI, insecure)
 		if tlsErr != nil {
 			cmd.Printf("Failed to prepare L4 TLS config: %v\n", tlsErr)
 			return
@@ -126,7 +126,7 @@ func runTProxy(cmd *cobra.Command, _ []string) {
 		return
 	}
 	defer tunDev.Close()
-	go api.MaintainTunnel(context.Background(), api.MaintainTunnelConfig{
+	go api.MaintainTunnel(ctx, api.MaintainTunnelConfig{
 		TLSConfig: tlsConfig, KeepalivePeriod: keepalive, InitialPacketSize: initialPacketSize,
 		Endpoint: endpoint, Device: api.NewNetstackAdapter(tunDev), MTU: mtu,
 		ReconnectDelay: reconnectDelay, AlwaysReconnect: alwaysReconnect, UseHTTP2: useHTTP2,
@@ -180,12 +180,21 @@ func runTProxy(cmd *cobra.Command, _ []string) {
 	udpTimeout, _ := cmd.Flags().GetDuration("udp-timeout")
 	log.Printf("TPROXY TCP and UDP listeners listening on %s", listenAddresses)
 	for _, listener := range tcpListeners {
-		go acceptTransparentTCP(cmd.Context(), listener, tunNet, tcpProxy)
+		go acceptTransparentTCP(ctx, listener, tunNet, tcpProxy)
 	}
 	for _, listener := range udpListeners {
-		go serveTransparentUDP(cmd.Context(), listener, tunNet, udpTimeout)
+		go serveTransparentUDP(ctx, listener, tunNet, udpTimeout)
 	}
-	select {}
+	go func() {
+		<-ctx.Done()
+		for _, listener := range tcpListeners {
+			_ = listener.Close()
+		}
+		for _, listener := range udpListeners {
+			_ = listener.Close()
+		}
+	}()
+	<-ctx.Done()
 }
 
 func acceptTransparentTCP(ctx context.Context, listener net.Listener, tunNet *netstack.Net, tcpProxy *api.L4Proxy) {
@@ -229,6 +238,19 @@ func proxyTransparentTCP(ctx context.Context, client net.Conn, tunNet *netstack.
 	api.RelayTCP(client, remote)
 }
 
+const transparentUDPBufferSize = 64 * 1024
+
+var transparentUDPBufferPool = sync.Pool{
+	New: func() any {
+		return make([]byte, transparentUDPBufferSize)
+	},
+}
+
+type transparentUDPFlowKey struct {
+	client      netip.AddrPort
+	destination netip.AddrPort
+}
+
 type transparentUDPFlow struct {
 	client    netip.AddrPort
 	remote    net.Conn
@@ -245,10 +267,10 @@ func (flow *transparentUDPFlow) close() {
 
 type transparentUDPFlows struct {
 	mu    sync.Mutex
-	items map[string]*transparentUDPFlow
+	items map[transparentUDPFlowKey]*transparentUDPFlow
 }
 
-func (flows *transparentUDPFlows) remove(key string, flow *transparentUDPFlow) {
+func (flows *transparentUDPFlows) remove(key transparentUDPFlowKey, flow *transparentUDPFlow) {
 	flows.mu.Lock()
 	if flows.items[key] == flow {
 		delete(flows.items, key)
@@ -270,7 +292,7 @@ func (flows *transparentUDPFlows) closeAll() {
 }
 
 func serveTransparentUDP(ctx context.Context, listener *net.UDPConn, tunNet *netstack.Net, timeout time.Duration) {
-	flows := &transparentUDPFlows{items: make(map[string]*transparentUDPFlow)}
+	flows := &transparentUDPFlows{items: make(map[transparentUDPFlowKey]*transparentUDPFlow)}
 	buffer := make([]byte, 64*1024)
 	controlBuffer := make([]byte, 256)
 	listenerDone := make(chan struct{})
@@ -300,7 +322,7 @@ func serveTransparentUDP(ctx context.Context, listener *net.UDPConn, tunNet *net
 		}
 		client = netip.AddrPortFrom(client.Addr().Unmap(), client.Port())
 		destination = netip.AddrPortFrom(destination.Addr().Unmap(), destination.Port())
-		key := client.String() + "|" + destination.String()
+		key := transparentUDPFlowKey{client: client, destination: destination}
 		flows.mu.Lock()
 		flow := flows.items[key]
 		flows.mu.Unlock()
@@ -338,8 +360,9 @@ func serveTransparentUDP(ctx context.Context, listener *net.UDPConn, tunNet *net
 	}
 }
 
-func relayTransparentUDP(flow *transparentUDPFlow, key string, flows *transparentUDPFlows, timeout time.Duration) {
-	buffer := make([]byte, 64*1024)
+func relayTransparentUDP(flow *transparentUDPFlow, key transparentUDPFlowKey, flows *transparentUDPFlows, timeout time.Duration) {
+	buffer := transparentUDPBufferPool.Get().([]byte)
+	defer transparentUDPBufferPool.Put(buffer)
 	for {
 		if timeout > 0 {
 			_ = flow.remote.SetReadDeadline(time.Now().Add(timeout))

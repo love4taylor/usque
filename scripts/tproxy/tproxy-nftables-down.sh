@@ -24,7 +24,7 @@ if [ "$IPV6_ENABLED" = 1 ]; then
 fi
 
 "$NFT" delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
-"$IP" -4 route del 0.0.0.0/0 dev lo table "$ROUTE_TABLE" >/dev/null 2>&1 || true
+"$IP" -4 route del local 0.0.0.0/0 dev lo table "$ROUTE_TABLE" >/dev/null 2>&1 || true
 if [ "$IPV6_ENABLED" = 1 ]; then
     "$IP" -6 route del local ::/0 dev lo table "$ROUTE_TABLE" >/dev/null 2>&1 || true
     "$IP" -6 route del ::/0 dev lo table "$ROUTE_TABLE" >/dev/null 2>&1 || true

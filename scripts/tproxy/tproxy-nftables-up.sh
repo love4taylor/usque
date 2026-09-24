@@ -8,6 +8,7 @@ ROUTE_TABLE="${USQUE_TPROXY_TABLE:-100}"
 MARK="${USQUE_TPROXY_MARK:-0x1/0x1}"
 RULE_PRIORITY="${USQUE_TPROXY_RULE_PRIORITY:-100}"
 PORT="${USQUE_TPROXY_PORT:-12345}"
+BIND="${USQUE_TPROXY_BIND:-127.0.0.1}"
 BIND_V6="${USQUE_TPROXY_BIND_V6:-}"
 STATE="${USQUE_TPROXY_STATE:-/run/usque-tproxy.state}"
 LOCK="${USQUE_TPROXY_LOCK:-/run/usque-tproxy.lock}"
@@ -39,6 +40,18 @@ valid_mark() {
     esac
 }
 
+valid_ipv4() {
+    case "$1" in
+        ''|*[!0-9.]*) return 1 ;;
+    esac
+}
+
+valid_ipv6() {
+    case "$1" in
+        ''|*[!0-9a-fA-F:]*) return 1 ;;
+    esac
+}
+
 check_firewalld_rpfilter() {
     [ "${USQUE_TPROXY_CHECK_FIREWALLD:-1}" = 1 ] || return 0
     [ -n "$BIND_V6" ] || return 0
@@ -67,6 +80,8 @@ esac
 valid_number "$ROUTE_TABLE" || fail "invalid route table: $ROUTE_TABLE"
 valid_number "$RULE_PRIORITY" || fail "invalid rule priority: $RULE_PRIORITY"
 valid_number "$PORT" || fail "invalid TPROXY port: $PORT"
+valid_ipv4 "$BIND" || fail "invalid IPv4 TPROXY bind address: $BIND"
+[ -z "$BIND_V6" ] || valid_ipv6 "$BIND_V6" || fail "invalid IPv6 TPROXY bind address: $BIND_V6"
 
 MARK_VALUE=${MARK%%/*}
 MARK_MASK=${MARK#*/}
@@ -118,7 +133,7 @@ cleanup() {
     rm -f "$RULES_FILE"
     if [ "$success" -ne 1 ] && [ "$applied" -eq 1 ]; then
         while "$IP" -4 rule del pref "$RULE_PRIORITY" fwmark "$MARK" lookup "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
-        "$IP" -4 route del 0.0.0.0/0 dev lo table "$ROUTE_TABLE" >/dev/null 2>&1 || true
+        "$IP" -4 route del local 0.0.0.0/0 dev lo table "$ROUTE_TABLE" >/dev/null 2>&1 || true
         if [ -n "$BIND_V6" ]; then
             while "$IP" -6 rule del pref "$RULE_PRIORITY" fwmark "$MARK" lookup "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
             "$IP" -6 route del local ::/0 dev lo table "$ROUTE_TABLE" >/dev/null 2>&1 || true
@@ -156,13 +171,13 @@ EOF
         [ -n "$endpoint6" ] && printf '        ip6 daddr %s return\n' "$endpoint6"
     fi
     cat <<EOF
-        meta nfproto ipv4 meta l4proto tcp tproxy ip to 127.0.0.1:$PORT meta mark set $MARK_VALUE
-        meta nfproto ipv4 meta l4proto udp tproxy ip to 127.0.0.1:$PORT meta mark set $MARK_VALUE
+        meta nfproto ipv4 meta l4proto tcp tproxy ip to $BIND:$PORT meta mark set $MARK_VALUE
+        meta nfproto ipv4 meta l4proto udp tproxy ip to $BIND:$PORT meta mark set $MARK_VALUE
 EOF
     if [ -n "$BIND_V6" ]; then
         cat <<EOF
-        meta nfproto ipv6 meta l4proto tcp tproxy ip6 to [::1]:$PORT meta mark set $MARK_VALUE
-        meta nfproto ipv6 meta l4proto udp tproxy ip6 to [::1]:$PORT meta mark set $MARK_VALUE
+        meta nfproto ipv6 meta l4proto tcp tproxy ip6 to [$BIND_V6]:$PORT meta mark set $MARK_VALUE
+        meta nfproto ipv6 meta l4proto udp tproxy ip6 to [$BIND_V6]:$PORT meta mark set $MARK_VALUE
 EOF
     fi
     cat <<EOF
@@ -199,7 +214,7 @@ EOF
 applied=1
 
 while "$IP" -4 rule del pref "$RULE_PRIORITY" fwmark "$MARK" lookup "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
-"$IP" -4 route replace 0.0.0.0/0 dev lo table "$ROUTE_TABLE"
+"$IP" -4 route replace local 0.0.0.0/0 dev lo table "$ROUTE_TABLE"
 "$IP" -4 rule add pref "$RULE_PRIORITY" fwmark "$MARK" lookup "$ROUTE_TABLE"
 if [ -n "$BIND_V6" ]; then
     while "$IP" -6 rule del pref "$RULE_PRIORITY" fwmark "$MARK" lookup "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
