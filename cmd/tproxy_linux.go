@@ -388,7 +388,7 @@ func init() {
 	tproxyCmd.Flags().StringP("sni-address", "s", internal.ConnectSNI, "SNI address to use for MASQUE connection")
 	tproxyCmd.Flags().DurationP("keepalive-period", "k", 30*time.Second, "Keepalive period for MASQUE connection")
 	tproxyCmd.Flags().IntP("mtu", "m", 1280, "MTU for MASQUE connection")
-	tproxyCmd.Flags().Uint16P("initial-packet-size", "i", 0, "Custom initial packet size for MASQUE connection")
+	tproxyCmd.Flags().Uint16P("initial-packet-size", "i", internal.DefaultInitialPacketSize, internal.InitialPacketSizeHelp)
 	tproxyCmd.Flags().DurationP("reconnect-delay", "r", time.Second, "Delay between reconnect attempts")
 	tproxyCmd.Flags().Duration("udp-timeout", 60*time.Second, "Idle timeout for transparent UDP flows")
 	tproxyCmd.Flags().Bool("always-reconnect", true, "Always reconnect after tunnel loss")
