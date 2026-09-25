@@ -18,6 +18,7 @@ import (
 const (
 	defaultL4ConnectTimeout    = 15 * time.Second
 	defaultL4ConnectRetryCount = 2
+	maxConcurrentL4Handshakes  = 4
 )
 
 // DNSResolver resolves a hostname for L4Proxy local DNS mode.
@@ -92,7 +93,7 @@ func NewL4Proxy(cfg L4ProxyConfig) (*L4Proxy, error) {
 		onDisconnect:      cfg.OnDisconnect,
 		connectTimeout:    cfg.ConnectTimeout,
 		connectRetryCount: cfg.ConnectRetryCount,
-		connectSlot:       make(chan struct{}, 1),
+		connectSlot:       make(chan struct{}, maxConcurrentL4Handshakes),
 	}
 	proxy.dialFn = proxy.dial
 	return proxy, nil
