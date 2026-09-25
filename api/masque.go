@@ -200,7 +200,14 @@ func connectTunnelHTTP3(ctx context.Context, tlsConfig *tls.Config, quicConfig *
 	}
 
 	hconn := tr.NewClientConn(conn)
-	ipConn, rsp, err := connectip.Dial(ctx, hconn, template, "cf-connect-ip", additionalHeaders, true)
+	request, err := connectip.NewRequestWithOptions(ctx, template, "cf-connect-ip", additionalHeaders)
+	if err != nil {
+		_ = tr.Close()
+		_ = conn.CloseWithError(0, "connect-ip request creation failed")
+		_ = udpConn.Close()
+		return nil, nil, nil, nil, err
+	}
+	ipConn, rsp, err := connectip.NewClientConnWithOptions(hconn, "", nil, true).Dial(request)
 	if err != nil {
 		_ = tr.Close()
 		_ = conn.CloseWithError(0, "connect-ip dial failed")

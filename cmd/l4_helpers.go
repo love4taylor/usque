@@ -173,6 +173,9 @@ func l4QUICConfig(keepalivePeriod time.Duration, initialPacketSize uint16) *quic
 		MaxIncomingStreams:             100,
 		MaxIncomingUniStreams:          100,
 	}
+	cfg.Congestion = func() quic.SendAlgorithmWithDebugInfos {
+		return quic.NewBBRv1(cfg)
+	}
 	if initialPacketSize > 0 {
 		cfg.InitialPacketSize = initialPacketSize
 		cfg.DisablePathMTUDiscovery = true
