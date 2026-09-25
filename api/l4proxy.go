@@ -50,7 +50,7 @@ type L4Proxy struct {
 	connectTimeout    time.Duration
 	connectRetryCount int
 	connMu            sync.Mutex
-	connectMu         sync.Mutex
+	connectSlot       chan struct{}
 	client            *l4HTTP3Client
 	closed            bool
 	dialFn            func(context.Context, string) (*l4TCPConn, error)
@@ -59,7 +59,9 @@ type L4Proxy struct {
 type l4HTTP3Client struct {
 	udpConn    *net.UDPConn
 	quicConn   *quic.Conn
-	clientConn *http3.ClientConn
+	clientConn interface {
+		OpenRequestStream(context.Context) (*http3.RequestStream, error)
+	}
 }
 
 // NewL4Proxy creates an L4 proxy dialer from a configuration struct.
@@ -90,6 +92,7 @@ func NewL4Proxy(cfg L4ProxyConfig) (*L4Proxy, error) {
 		onDisconnect:      cfg.OnDisconnect,
 		connectTimeout:    cfg.ConnectTimeout,
 		connectRetryCount: cfg.ConnectRetryCount,
+		connectSlot:       make(chan struct{}, 1),
 	}
 	proxy.dialFn = proxy.dial
 	return proxy, nil
@@ -177,44 +180,59 @@ func (p *L4Proxy) dial(ctx context.Context, target string) (*l4TCPConn, error) {
 
 	stream, err := h3Client.clientConn.OpenRequestStream(ctx)
 	if err != nil {
-		if !shouldReconnectOnOpenStreamError(ctx, err) {
-			return nil, err
+		reconnect := shouldReconnectOnOpenStreamError(ctx, err)
+		if reconnect || errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			p.closeClientConnIfCurrent(h3Client)
+		}
+		if !reconnect {
+			return nil, fmt.Errorf("opening L4 request stream: %w", err)
 		}
 		// The cached HTTP/3 connection might be stale; reconnect once and retry.
-		p.closeClientConnIfCurrent(h3Client)
 		h3Client, err = p.getOrCreateClientConn(ctx)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("establishing L4 QUIC connection: %w", err)
 		}
 		stream, err = h3Client.clientConn.OpenRequestStream(ctx)
 		if err != nil {
-			if shouldReconnectOnOpenStreamError(ctx, err) {
+			if shouldReconnectOnOpenStreamError(ctx, err) || errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				p.closeClientConnIfCurrent(h3Client)
 			}
+			return nil, fmt.Errorf("opening L4 request stream: %w", err)
+		}
+	}
+	defer func() {
+		if stream != nil {
+			stream.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+			stream.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+		}
+	}()
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := stream.SetDeadline(deadline); err != nil {
 			return nil, err
 		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "https://"+target, nil)
 	if err != nil {
-		_ = stream.Close()
 		return nil, err
 	}
 	req.Host = target
 	if err := stream.SendRequestHeader(req); err != nil {
-		_ = stream.Close()
-		return nil, err
+		return nil, fmt.Errorf("sending L4 CONNECT request: %w", err)
 	}
 	response, err := stream.ReadResponse()
 	if err != nil {
-		_ = stream.Close()
-		return nil, err
+		return nil, fmt.Errorf("reading L4 CONNECT response: %w", err)
 	}
 	if response.StatusCode < 200 || response.StatusCode > 299 {
-		_ = stream.Close()
 		return nil, fmt.Errorf("CONNECT rejected with status %d", response.StatusCode)
 	}
-	return &l4TCPConn{stream: stream, local: h3Client.udpConn.LocalAddr(), remote: l4Addr(target)}, nil
+	if err := stream.SetDeadline(time.Time{}); err != nil {
+		return nil, err
+	}
+	openStream := stream
+	stream = nil
+	return &l4TCPConn{stream: openStream, local: h3Client.udpConn.LocalAddr(), remote: l4Addr(target)}, nil
 }
 
 func shouldReconnectOnOpenStreamError(ctx context.Context, err error) bool {
@@ -243,8 +261,12 @@ func (p *L4Proxy) getOrCreateClientConn(ctx context.Context) (*l4HTTP3Client, er
 	}
 	p.connMu.Unlock()
 
-	p.connectMu.Lock()
-	defer p.connectMu.Unlock()
+	select {
+	case p.connectSlot <- struct{}{}:
+		defer func() { <-p.connectSlot }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 
 	p.connMu.Lock()
 	if p.closed {
@@ -268,7 +290,7 @@ func (p *L4Proxy) getOrCreateClientConn(ctx context.Context) (*l4HTTP3Client, er
 	quicConn, err := qtr.Dial(ctx, p.endpoint, p.tlsConfig, p.quicConfig)
 	if err != nil {
 		_ = udpConn.Close()
-		return nil, err
+		return nil, fmt.Errorf("dialing L4 QUIC endpoint: %w", err)
 	}
 
 	newClient := &l4HTTP3Client{
